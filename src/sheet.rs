@@ -6,7 +6,7 @@ macro_rules! row {
         {
             let mut row = Row::new();
             $(row.add_cell($x);)*
-            row
+                row
         }
     };
 }
@@ -27,6 +27,15 @@ pub struct Sheet {
     pub name: String,
     pub columns: Vec<Column>,
     max_row_index: usize,
+    merged_cells: Vec<MergedCell>,
+}
+
+#[derive(Default, Clone)]
+pub struct MergedCell {
+    pub column_index: usize,
+    pub row_index: usize,
+    pub column_span: usize,
+    pub row_span: usize,
 }
 
 #[derive(Default)]
@@ -139,11 +148,18 @@ impl Row {
         })
     }
 
-    pub fn write(&mut self, writer: &mut dyn Write) -> Result<()> {
+    pub fn write(&mut self, writer: &mut dyn Write, merged_cells: &Vec<MergedCell>) -> Result<()> {
         let head = format!("<row r=\"{}\">\n", self.row_index);
         writer.write_all(head.as_bytes())?;
         for c in self.cells.iter() {
-            c.write(self.row_index, writer)?;
+            let prev_col_cells: Vec<&MergedCell> = merged_cells
+                .iter()
+                .filter(|mc| mc.column_index < c.column_index)
+                .collect();
+            let prev_col_span = prev_col_cells
+                .iter()
+                .fold(0, |a, cell| a + cell.column_span);
+            c.write(self.row_index, writer, prev_col_span)?;
         }
         writer.write_all(b"\n</row>\n")
     }
@@ -205,8 +221,12 @@ fn escape_xml(str: &str) -> String {
 }
 
 impl Cell {
-    fn write(&self, row_index: usize, writer: &mut dyn Write) -> Result<()> {
-        let ref_id = format!("{}{}", column_letter(self.column_index), row_index);
+    fn write(&self, row_index: usize, writer: &mut dyn Write, prev_col_span: usize) -> Result<()> {
+        let ref_id = format!(
+            "{}{}",
+            column_letter(self.column_index + prev_col_span),
+            row_index
+        );
         write_value(&self.value, ref_id, writer)
     }
 }
@@ -252,13 +272,18 @@ impl Sheet {
         self.columns.push(column)
     }
 
-    fn write_row<W>(&mut self, writer: &mut W, mut row: Row) -> Result<()>
+    fn write_row<W>(
+        &mut self,
+        writer: &mut W,
+        mut row: Row,
+        merged_cells: &Vec<MergedCell>,
+    ) -> Result<()>
     where
         W: Write + Sized,
     {
         self.max_row_index += 1;
         row.row_index = self.max_row_index;
-        row.write(writer)
+        row.write(writer, merged_cells)
     }
 
     fn write_blank_rows(&mut self, rows: usize) {
@@ -272,8 +297,8 @@ impl Sheet {
         "#;
         writer.write_all(header.as_bytes())?;
         /*
-                let dimension = format!("<dimension ref=\"A1:{}{}\"/>", column_letter(self.dimension.columns), self.dimension.rows);
-                writer.write_all(dimension.as_bytes())?;
+        let dimension = format!("<dimension ref=\"A1:{}{}\"/>", column_letter(self.dimension.columns), self.dimension.rows);
+        writer.write_all(dimension.as_bytes())?;
         */
 
         if self.columns.is_empty() {
@@ -293,6 +318,30 @@ impl Sheet {
             i += 1;
         }
         writer.write_all(b"</cols>\n")
+    }
+
+    fn write_merged_cells(&self, writer: &mut dyn Write) -> Result<()> {
+        if self.merged_cells.len() > 0 {
+            writer.write_all(
+                format!("\n<mergeCells count=\"{}\">", self.merged_cells.len()).as_bytes(),
+            )?;
+
+            for mc in self.merged_cells.iter() {
+                let start = format!("{}{}", column_letter(mc.column_index), mc.row_index);
+                let end = format!(
+                    "{}{}",
+                    column_letter(mc.column_index + mc.column_span),
+                    mc.row_index + mc.row_span
+                );
+
+                writer
+                    .write_all(format!("\n\t<mergeCell ref=\"{}:{}\" />", start, end).as_bytes())?;
+            }
+
+            writer.write_all(b"\n</mergeCells>\n")
+        } else {
+            Ok(())
+        }
     }
 
     fn write_data_begin(&self, writer: &mut dyn Write) -> Result<()> {
@@ -321,10 +370,39 @@ impl<'a, 'b> SheetWriter<'a, 'b> {
         }
     }
 
-    pub fn append_row(&mut self, row: Row) -> Result<()> {
-        self.sheet
-            .write_row(self.writer, row.replace_strings(&mut self.shared_strings))
+    pub fn merge_cells(
+        &mut self,
+        column_index: usize,
+        row_index: usize,
+        column_span: usize,
+        row_span: usize,
+    ) {
+        self.sheet.merged_cells.push(MergedCell {
+            column_index,
+            row_index,
+            column_span,
+            row_span,
+        });
     }
+
+    pub fn append_row(&mut self, row: Row) -> Result<()> {
+        let merged_cells: Vec<MergedCell> = self
+            .sheet
+            .merged_cells
+            .iter()
+            .filter(|x| {
+                x.row_index <= self.sheet.max_row_index + 1
+                    && x.row_index + x.row_span >= self.sheet.max_row_index + 1
+            })
+            .map(|x| x.clone())
+            .collect();
+        self.sheet.write_row(
+            self.writer,
+            row.replace_strings(&mut self.shared_strings),
+            &merged_cells,
+        )
+    }
+
     pub fn append_blank_rows(&mut self, rows: usize) {
         self.sheet.write_blank_rows(rows)
     }
@@ -340,6 +418,7 @@ impl<'a, 'b> SheetWriter<'a, 'b> {
         write_data(self)?;
 
         self.sheet.write_data_end(self.writer)?;
+        self.sheet.write_merged_cells(self.writer)?;
         self.sheet.close(self.writer)
     }
 }
